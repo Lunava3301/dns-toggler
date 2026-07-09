@@ -247,16 +247,17 @@ def set_dns(dns_list):
             
     elif IS_MAC:
         try:
+            cmd_prefix = ["sudo"] if os.getuid() != 0 else []
             if not dns_list:
                 run_command_with_spinner(
-                    ["networksetup", "-setdnsservers", INTERFACE, "Empty"],
+                    cmd_prefix + ["networksetup", "-setdnsservers", INTERFACE, "Empty"],
                     "Сбрасываем DNS на автоматический (DHCP)..."
                 )
                 print(f"{GREEN}DNS успешно сброшен на автоматический (DHCP)!{RESET}")
             else:
                 dns_str = ", ".join(dns_list)
                 run_command_with_spinner(
-                    ["networksetup", "-setdnsservers", INTERFACE] + dns_list,
+                    cmd_prefix + ["networksetup", "-setdnsservers", INTERFACE] + dns_list,
                     f"Устанавливаем DNS: {dns_str}..."
                 )
                 print(f"{GREEN}DNS успешно изменен на {dns_str}!{RESET}")
@@ -297,29 +298,40 @@ def check_and_request_admin():
             sys.exit(0)
             
     elif IS_MAC:
-        # Шаг 1: Если мы уже root, просто выходим
+        # Если мы уже root, ничего делать не нужно
         if os.getuid() == 0:
             return
 
-        # Шаг 2: Проверяем, есть ли уже беспарольный доступ к sudo
+        # 1. Проверяем беспарольный доступ к sudo
         try:
-            res = subprocess.run(["sudo", "-n", "true"], capture_output=True, text=True)
-            can_sudo_nopasswd = (res.returncode == 0)
+            res_true = subprocess.run(["sudo", "-n", "true"], capture_output=True, text=True)
+            can_sudo_nopasswd = (res_true.returncode == 0)
         except Exception:
             can_sudo_nopasswd = False
 
+        # Также проверим, работает ли уже беспарольный запуск самого networksetup
+        try:
+            res_ns = subprocess.run(["sudo", "-n", "/usr/sbin/networksetup", "-listallnetworkservices"], capture_output=True)
+            can_sudo_networksetup = (res_ns.returncode == 0)
+        except Exception:
+            can_sudo_networksetup = False
+
         if can_sudo_nopasswd:
-            # Если беспарольный доступ уже настроен, тихо перезапускаемся через sudo
+            # Если есть общий беспарольный доступ, перезапускаемся под sudo
             try:
                 os.execv('/usr/bin/sudo', ['sudo', sys.executable] + sys.argv)
             except Exception as e:
                 print(f"{RED}Ошибка автоматического перезапуска через sudo: {e}{RESET}")
                 sys.exit(1)
+        elif can_sudo_networksetup:
+            # Если настроен беспарольный networksetup, работаем как обычный пользователь
+            # (команды networksetup будут вызываться через sudo без ввода пароля)
+            return
         else:
-            # Шаг 3: Если беспарольного доступа нет, настраиваем NOPASSWD при первом запуске
+            # 2. Если доступа нет, настраиваем NOPASSWD для networksetup при первом запуске
             print(f"{BOLD}{PURPLE}════ Настройка беспарольного режима DNS Toggler ════{RESET}")
-            print(f"{CYAN}Для работы утилиты требуются права администратора.{RESET}")
-            print(f"Сейчас мы добавим правило в {GRAY}/etc/sudoers.d/dns_toggler_perms{RESET}.")
+            print(f"{CYAN}Для работы утилиты требуются права на изменение настроек сети.{RESET}")
+            print(f"Сейчас мы добавим правило для {GRAY}networksetup{RESET} в {GRAY}/etc/sudoers.d/dns_toggler_perms{RESET}.")
             print(f"{YELLOW}Пожалуйста, введите пароль администратора в последний раз для настройки...{RESET}\n")
 
             try:
@@ -327,54 +339,35 @@ def check_and_request_admin():
                 if not user_name:
                     import getpass
                     user_name = getpass.getuser()
-                python_path = sys.executable
-                script_path = os.path.abspath(sys.argv[0])
                 
-                # Пробуем формат, запрошенный пользователем (* в пути команды)
-                rule = f"{user_name} ALL=(ALL) NOPASSWD: * {script_path}"
+                rule = f"{user_name} ALL=(ALL) NOPASSWD: /usr/sbin/networksetup"
                 
-                # Записываем файл правила
+                # 3. Удаляем старый файл и записываем новый
+                subprocess.run("sudo rm -f /etc/sudoers.d/dns_toggler_perms", shell=True)
+                
                 write_cmd = f'echo "{rule}" | sudo tee /etc/sudoers.d/dns_toggler_perms > /dev/null'
                 subprocess.run(write_cmd, shell=True, check=True)
                 
-                # Устанавливаем правильные права доступа (0440)
-                chmod_cmd = 'sudo chmod 440 /etc/sudoers.d/dns_toggler_perms'
+                chmod_cmd = 'sudo chmod 0440 /etc/sudoers.d/dns_toggler_perms'
                 subprocess.run(chmod_cmd, shell=True, check=True)
                 
                 # Проверяем синтаксис sudoers
                 check_res = subprocess.run(["sudo", "visudo", "-c"], capture_output=True, text=True)
                 if check_res.returncode != 0:
-                    # Если синтаксис с * не поддерживается, используем безопасный кросс-интерпретаторный fallback
-                    fallback_rule = (
-                        f"{user_name} ALL=(ALL) NOPASSWD: "
-                        f"/usr/bin/python* {script_path}, "
-                        f"/usr/local/bin/python* {script_path}, "
-                        f"/opt/homebrew/bin/python* {script_path}, "
-                        f"{python_path} {script_path}, "
-                        f"{script_path}"
-                    )
-                    write_cmd_fallback = f'echo "{fallback_rule}" | sudo tee /etc/sudoers.d/dns_toggler_perms > /dev/null'
-                    subprocess.run(write_cmd_fallback, shell=True, check=True)
-                    subprocess.run(chmod_cmd, shell=True, check=True)
-                    
-                    # Проверяем синтаксис fallback-правила
-                    check_res_fallback = subprocess.run(["sudo", "visudo", "-c"], capture_output=True, text=True)
-                    if check_res_fallback.returncode != 0:
-                        # Если и fallback не прошел, удаляем файл
-                        subprocess.run(["sudo", "rm", "-f", "/etc/sudoers.d/dns_toggler_perms"])
-                        raise Exception(f"Некорректный синтаксис sudoers: {check_res_fallback.stderr.strip()}")
+                    subprocess.run(["sudo", "rm", "-f", "/etc/sudoers.d/dns_toggler_perms"])
+                    raise Exception(f"Некорректный синтаксис sudoers: {check_res.stderr.strip()}")
                 
-                print(f"\n{GREEN}Беспарольный режим успешно настроен!{RESET}")
+                print(f"\n{GREEN}Беспарольный доступ для networksetup успешно настроен!{RESET}")
                 time.sleep(1.0)
                 
-                # Шаг 4: Перезапускаем скрипт уже с новыми правами
-                os.execv('/usr/bin/sudo', ['sudo', sys.executable] + sys.argv)
+                # Возвращаемся, так как networksetup теперь можно выполнять через sudo без пароля
+                return
             except Exception as e:
                 print(f"\n{RED}Не удалось настроить авто-доступ: {e}{RESET}")
                 print(f"{YELLOW}Переходим к обычному запуску с запросом пароля...{RESET}\n")
                 time.sleep(2.0)
                 
-                # Обычный перезапуск с паролем в качестве fallback
+                # 4. Фолбэк на обычный sudo перезапуск с запросом пароля
                 try:
                     os.execv('/usr/bin/sudo', ['sudo', sys.executable] + sys.argv)
                 except Exception as e_fallback:

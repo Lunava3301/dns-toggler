@@ -283,7 +283,7 @@ def print_status(current, custom_ips):
     else:
         print(f"Статус DNS:        {GREEN}{BOLD}АВТОМАТИЧЕСКИЙ (DHCP){RESET}")
 
-def main():
+def check_and_request_admin():
     # Автоматическое повышение привилегий
     if IS_WIN:
         import ctypes
@@ -297,13 +297,76 @@ def main():
             sys.exit(0)
             
     elif IS_MAC:
-        if os.getuid() != 0:
-            print(f"{YELLOW}Запрос прав суперпользователя (sudo) для изменения настроек сети...{RESET}")
+        # Если мы уже root, ничего делать не нужно
+        if os.getuid() == 0:
+            return
+
+        # 1. Проверяем, есть ли уже беспарольный доступ к sudo
+        try:
+            res = subprocess.run(["sudo", "-n", "true"], capture_output=True, text=True)
+            can_sudo_nopasswd = (res.returncode == 0)
+        except Exception:
+            can_sudo_nopasswd = False
+
+        if can_sudo_nopasswd:
+            # Если беспарольный доступ уже настроен, тихо перезапускаемся через sudo
             try:
                 os.execv('/usr/bin/sudo', ['sudo', sys.executable] + sys.argv)
             except Exception as e:
-                print(f"{RED}Не удалось получить права sudo: {e}{RESET}")
+                print(f"{RED}Ошибка автоматического перезапуска через sudo: {e}{RESET}")
                 sys.exit(1)
+        else:
+            # 2. Если беспарольного доступа нет, настраиваем NOPASSWD при первом запуске
+            print(f"{BOLD}{PURPLE}════ Настройка беспарольного режима DNS Toggler ════{RESET}")
+            print(f"{CYAN}Для работы утилиты требуются права администратора.{RESET}")
+            print(f"Сейчас мы добавим правило в {GRAY}/etc/sudoers.d/dns_toggler_perms{RESET}.")
+            print(f"{YELLOW}Пожалуйста, введите пароль администратора в последний раз для настройки...{RESET}\n")
+
+            try:
+                user_name = os.environ.get('USER')
+                if not user_name:
+                    import getpass
+                    user_name = getpass.getuser()
+                python_path = sys.executable
+                script_path = os.path.abspath(sys.argv[0])
+                
+                # Формируем правило
+                rule = f"{user_name} ALL=(ALL) NOPASSWD: {python_path} {script_path}"
+                
+                # Записываем файл правила
+                write_cmd = f'echo "{rule}" | sudo tee /etc/sudoers.d/dns_toggler_perms > /dev/null'
+                subprocess.run(write_cmd, shell=True, check=True)
+                
+                # Устанавливаем правильные права доступа (0440)
+                chmod_cmd = 'sudo chmod 440 /etc/sudoers.d/dns_toggler_perms'
+                subprocess.run(chmod_cmd, shell=True, check=True)
+                
+                # Проверяем синтаксис sudoers на всякий случай
+                check_res = subprocess.run(["sudo", "visudo", "-c"], capture_output=True, text=True)
+                if check_res.returncode != 0:
+                    # Если синтаксис неверный, откатываем во избежание проблем
+                    subprocess.run(["sudo", "rm", "-f", "/etc/sudoers.d/dns_toggler_perms"])
+                    raise Exception(f"Некорректный синтаксис sudoers: {check_res.stderr.strip()}")
+                
+                print(f"\n{GREEN}Беспарольный режим успешно настроен!{RESET}")
+                time.sleep(1.0)
+                
+                # Перезапускаем скрипт уже с новыми правами
+                os.execv('/usr/bin/sudo', ['sudo', sys.executable] + sys.argv)
+            except Exception as e:
+                print(f"\n{RED}Не удалось настроить авто-доступ: {e}{RESET}")
+                print(f"{YELLOW}Переходим к обычному запуску с запросом пароля...{RESET}\n")
+                time.sleep(2.0)
+                
+                # Обычный перезапуск с паролем в качестве fallback
+                try:
+                    os.execv('/usr/bin/sudo', ['sudo', sys.executable] + sys.argv)
+                except Exception as e_fallback:
+                    print(f"{RED}Не удалось запустить через sudo: {e_fallback}{RESET}")
+                    sys.exit(1)
+
+def main():
+    check_and_request_admin()
 
     while True:
         os.system("clear" if os.name != "nt" else "cls")

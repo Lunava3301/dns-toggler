@@ -297,11 +297,11 @@ def check_and_request_admin():
             sys.exit(0)
             
     elif IS_MAC:
-        # Если мы уже root, ничего делать не нужно
+        # Шаг 1: Если мы уже root, просто выходим
         if os.getuid() == 0:
             return
 
-        # 1. Проверяем, есть ли уже беспарольный доступ к sudo
+        # Шаг 2: Проверяем, есть ли уже беспарольный доступ к sudo
         try:
             res = subprocess.run(["sudo", "-n", "true"], capture_output=True, text=True)
             can_sudo_nopasswd = (res.returncode == 0)
@@ -316,22 +316,22 @@ def check_and_request_admin():
                 print(f"{RED}Ошибка автоматического перезапуска через sudo: {e}{RESET}")
                 sys.exit(1)
         else:
-            # 2. Если беспарольного доступа нет, настраиваем NOPASSWD при первом запуске
+            # Шаг 3: Если беспарольного доступа нет, настраиваем NOPASSWD при первом запуске
             print(f"{BOLD}{PURPLE}════ Настройка беспарольного режима DNS Toggler ════{RESET}")
             print(f"{CYAN}Для работы утилиты требуются права администратора.{RESET}")
             print(f"Сейчас мы добавим правило в {GRAY}/etc/sudoers.d/dns_toggler_perms{RESET}.")
             print(f"{YELLOW}Пожалуйста, введите пароль администратора в последний раз для настройки...{RESET}\n")
 
             try:
-                user_name = os.environ.get('USER')
+                user_name = os.environ.get('USER') or os.environ.get('SUDO_USER')
                 if not user_name:
                     import getpass
                     user_name = getpass.getuser()
                 python_path = sys.executable
                 script_path = os.path.abspath(sys.argv[0])
                 
-                # Формируем правило
-                rule = f"{user_name} ALL=(ALL) NOPASSWD: {python_path} {script_path}"
+                # Пробуем формат, запрошенный пользователем (* в пути команды)
+                rule = f"{user_name} ALL=(ALL) NOPASSWD: * {script_path}"
                 
                 # Записываем файл правила
                 write_cmd = f'echo "{rule}" | sudo tee /etc/sudoers.d/dns_toggler_perms > /dev/null'
@@ -341,17 +341,33 @@ def check_and_request_admin():
                 chmod_cmd = 'sudo chmod 440 /etc/sudoers.d/dns_toggler_perms'
                 subprocess.run(chmod_cmd, shell=True, check=True)
                 
-                # Проверяем синтаксис sudoers на всякий случай
+                # Проверяем синтаксис sudoers
                 check_res = subprocess.run(["sudo", "visudo", "-c"], capture_output=True, text=True)
                 if check_res.returncode != 0:
-                    # Если синтаксис неверный, откатываем во избежание проблем
-                    subprocess.run(["sudo", "rm", "-f", "/etc/sudoers.d/dns_toggler_perms"])
-                    raise Exception(f"Некорректный синтаксис sudoers: {check_res.stderr.strip()}")
+                    # Если синтаксис с * не поддерживается, используем безопасный кросс-интерпретаторный fallback
+                    fallback_rule = (
+                        f"{user_name} ALL=(ALL) NOPASSWD: "
+                        f"/usr/bin/python* {script_path}, "
+                        f"/usr/local/bin/python* {script_path}, "
+                        f"/opt/homebrew/bin/python* {script_path}, "
+                        f"{python_path} {script_path}, "
+                        f"{script_path}"
+                    )
+                    write_cmd_fallback = f'echo "{fallback_rule}" | sudo tee /etc/sudoers.d/dns_toggler_perms > /dev/null'
+                    subprocess.run(write_cmd_fallback, shell=True, check=True)
+                    subprocess.run(chmod_cmd, shell=True, check=True)
+                    
+                    # Проверяем синтаксис fallback-правила
+                    check_res_fallback = subprocess.run(["sudo", "visudo", "-c"], capture_output=True, text=True)
+                    if check_res_fallback.returncode != 0:
+                        # Если и fallback не прошел, удаляем файл
+                        subprocess.run(["sudo", "rm", "-f", "/etc/sudoers.d/dns_toggler_perms"])
+                        raise Exception(f"Некорректный синтаксис sudoers: {check_res_fallback.stderr.strip()}")
                 
                 print(f"\n{GREEN}Беспарольный режим успешно настроен!{RESET}")
                 time.sleep(1.0)
                 
-                # Перезапускаем скрипт уже с новыми правами
+                # Шаг 4: Перезапускаем скрипт уже с новыми правами
                 os.execv('/usr/bin/sudo', ['sudo', sys.executable] + sys.argv)
             except Exception as e:
                 print(f"\n{RED}Не удалось настроить авто-доступ: {e}{RESET}")
